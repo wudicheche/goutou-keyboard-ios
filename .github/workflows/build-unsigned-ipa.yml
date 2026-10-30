@@ -1,0 +1,92 @@
+# =============================================================================
+# 为「没有提交 .xcodeproj、只放 project.yml」的仓库准备的云构建：
+#   xcodegen generate → xcodebuild（关闭签名，device/arm64）→ 打 Payload → Artifact
+# 放到 .github/workflows/build-unsigned-ipa.yml 即可。
+# =============================================================================
+name: iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-unsigned-ipa.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- Xcode ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          latest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "${latest}" ]; then sudo xcode-select -s "${latest}/Contents/Developer" || true; fi
+          xcodebuild -version
+          echo "--- 生成器 ---"
+          xcodegen --version 2>/dev/null || echo "xcodegen missing"
+
+      - name: 安装 XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: 生成工程
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild -list -project GoutouInput.xcodeproj
+
+      - name: 编译（关闭代码签名，device / arm64）
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project GoutouInput.xcodeproj \
+            -scheme GoutouInput \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "${RUNNER_TEMP}/dd" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包 ipa
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR="${RUNNER_TEMP}/dd/Build/Products/Release-iphoneos"
+          APP="$(find "${PRODUCT_DIR}" -maxdepth 1 -name '*.app' -print -quit)"
+          [ -n "${APP}" ] || { echo "::error::没有找到 .app"; ls -la "${PRODUCT_DIR}"; exit 1; }
+          echo "app: ${APP}"
+          echo "--- 内嵌扩展 ---"
+          ls "${APP}/PlugIns" || true
+          STAGE="${RUNNER_TEMP}/stage"
+          rm -rf "${STAGE}"; mkdir -p "${STAGE}/Payload"
+          cp -R "${APP}" "${STAGE}/Payload/"
+          IPA="${RUNNER_TEMP}/GoutouInput-unsigned.ipa"
+          ( cd "${STAGE}" && ditto -c -k --sequesterRsrc --keepParent Payload "${IPA}" )
+          echo "ipa=${IPA}" >> "${GITHUB_OUTPUT}"
+          unzip -l "${IPA}" | head -n 20
+          shasum -a 256 "${IPA}"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoutouInput-unsigned-ipa
+          path: ${{ steps.pack.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 30
